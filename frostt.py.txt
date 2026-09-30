@@ -1,0 +1,1893 @@
+import sqlite3
+import logging
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    LabeledPrice,
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    PreCheckoutQueryHandler,
+    MessageHandler,
+    filters,
+)
+
+from config import BOT_TOKEN
+
+
+# =========================================================
+# SOZLAMALAR
+# =========================================================
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN topilmadi! config.py ni tekshiring.")
+
+
+ADMIN_IDS = {
+    6383248812,
+}
+
+DB_NAME = "frostshop.db"
+
+
+# =========================================================
+# BOSHLANG'ICH NARXLAR
+# =========================================================
+
+STARS_PRICES = {
+    50: 11000,
+    100: 22000,
+    200: 44000,
+    300: 66000,
+    500: 110000,
+    1000: 220000,
+}
+
+PREMIUM_ACCOUNT_PRICES = {
+    1: 40000,
+    12: 310000,
+}
+
+PREMIUM_GIFT_PRICES = {
+    3: 170000,
+    6: 230000,
+    12: 395000,
+}
+
+
+# =========================================================
+# LOGGING
+# =========================================================
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+
+logger = logging.getLogger(__name__)
+
+
+# =========================================================
+# DATABASE
+# =========================================================
+
+def db():
+    return sqlite3.connect(DB_NAME)
+
+
+def init_db():
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            product_type TEXT NOT NULL,
+            product_name TEXT NOT NULL,
+            catalog_price INTEGER NOT NULL,
+            xtr_price INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'pending',
+            telegram_charge_id TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS stars_prices (
+            stars INTEGER PRIMARY KEY,
+            uzs_price INTEGER NOT NULL
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS premium_account_prices (
+            months INTEGER PRIMARY KEY,
+            uzs_price INTEGER NOT NULL
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS premium_gift_prices (
+            months INTEGER PRIMARY KEY,
+            uzs_price INTEGER NOT NULL
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS required_channels (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel TEXT UNIQUE NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    for stars, price in STARS_PRICES.items():
+        cur.execute("""
+            INSERT OR IGNORE INTO stars_prices
+            (stars, uzs_price)
+            VALUES (?, ?)
+        """, (stars, price))
+
+    for months, price in PREMIUM_ACCOUNT_PRICES.items():
+        cur.execute("""
+            INSERT OR IGNORE INTO premium_account_prices
+            (months, uzs_price)
+            VALUES (?, ?)
+        """, (months, price))
+
+    for months, price in PREMIUM_GIFT_PRICES.items():
+        cur.execute("""
+            INSERT OR IGNORE INTO premium_gift_prices
+            (months, uzs_price)
+            VALUES (?, ?)
+        """, (months, price))
+
+    conn.commit()
+    conn.close()
+
+    print("✅ Database tayyor")
+
+
+# =========================================================
+# USER
+# =========================================================
+
+def save_user(user):
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT OR REPLACE INTO users
+        (user_id, username, first_name)
+        VALUES (?, ?, ?)
+    """, (
+        user.id,
+        user.username or "",
+        user.first_name or "",
+    ))
+
+    conn.commit()
+    conn.close()
+
+
+def is_admin(user_id):
+    return user_id in ADMIN_IDS
+
+
+# =========================================================
+# MAJBURIY KANALLAR
+# =========================================================
+
+def get_required_channels():
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT id, channel
+        FROM required_channels
+        ORDER BY id
+    """)
+
+    rows = cur.fetchall()
+    conn.close()
+
+    return rows
+
+
+def add_required_channel(channel):
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT OR IGNORE INTO required_channels (channel)
+        VALUES (?)
+    """, (channel,))
+
+    added = cur.rowcount > 0
+
+    conn.commit()
+    conn.close()
+
+    return added
+
+
+def delete_required_channel(channel):
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        DELETE FROM required_channels
+        WHERE channel = ?
+    """, (channel,))
+
+    deleted = cur.rowcount > 0
+
+    conn.commit()
+    conn.close()
+
+    return deleted
+
+
+async def is_subscribed(bot, user_id):
+
+    # ADMIN UCHUN OBUNA KERAK EMAS
+    if is_admin(user_id):
+        return True
+
+    channels = get_required_channels()
+
+    if not channels:
+        return True
+
+    for _, channel in channels:
+        try:
+            member = await bot.get_chat_member(
+                chat_id=channel,
+                user_id=user_id
+            )
+
+            if member.status not in (
+                "creator",
+                "administrator",
+                "member",
+            ):
+                return False
+
+        except Exception as e:
+            logger.warning(
+                "Kanal tekshirish xatosi %s: %s",
+                channel,
+                e
+            )
+            return False
+
+    return True
+
+
+async def subscription_required(update, context):
+
+    user = update.effective_user
+
+    if is_admin(user.id):
+        return True
+
+    channels = get_required_channels()
+
+    if not channels:
+        return True
+
+    if await is_subscribed(context.bot, user.id):
+        return True
+
+    keyboard = []
+
+    for _, channel in channels:
+        username = channel.lstrip("@")
+
+        keyboard.append([
+            InlineKeyboardButton(
+                f"📢 {channel}",
+                url=f"https://t.me/{username}"
+            )
+        ])
+
+    keyboard.append([
+        InlineKeyboardButton(
+            "✅ Obunani tekshirish",
+            callback_data="check_sub"
+        )
+    ])
+
+    text = (
+        "🔒 Botdan foydalanish uchun "
+        "quyidagi kanallarga obuna bo‘ling.\n\n"
+        "Barcha kanallarga obuna bo‘lgach, "
+        "«Obunani tekshirish» tugmasini bosing."
+    )
+
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    elif update.message:
+        await update.message.reply_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    return False
+
+
+# =========================================================
+# NARXLAR
+# =========================================================
+
+def get_stars_prices():
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT stars, uzs_price
+        FROM stars_prices
+        ORDER BY stars
+    """)
+
+    rows = cur.fetchall()
+    conn.close()
+
+    return dict(rows)
+
+
+def get_account_prices():
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT months, uzs_price
+        FROM premium_account_prices
+        ORDER BY months
+    """)
+
+    rows = cur.fetchall()
+    conn.close()
+
+    return dict(rows)
+
+
+def get_gift_prices():
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT months, uzs_price
+        FROM premium_gift_prices
+        ORDER BY months
+    """)
+
+    rows = cur.fetchall()
+    conn.close()
+
+    return dict(rows)
+
+
+# =========================================================
+# HOME
+# =========================================================
+
+async def start(update, context):
+
+    save_user(update.effective_user)
+
+    if not await subscription_required(update, context):
+        return
+
+    await show_home(update, context)
+
+
+async def show_home(update, context):
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "⭐ Stars",
+                callback_data="stars"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "💎 Premium",
+                callback_data="premium"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "📦 Buyurtmalarim",
+                callback_data="orders"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "📞 Yordam",
+                callback_data="help"
+            )
+        ],
+    ]
+
+    if is_admin(update.effective_user.id):
+        keyboard.append([
+            InlineKeyboardButton(
+                "👑 Admin panel",
+                callback_data="admin"
+            )
+        ])
+
+    text = (
+        "🤖 FrostShop\n\n"
+        "⭐ Telegram Stars\n"
+        "💎 Telegram Premium\n\n"
+        "Kerakli xizmatni tanlang:"
+    )
+
+    markup = InlineKeyboardMarkup(keyboard)
+
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            text,
+            reply_markup=markup
+        )
+    else:
+        await update.message.reply_text(
+            text,
+            reply_markup=markup
+        )
+
+
+# =========================================================
+# STARS
+# =========================================================
+
+async def stars_menu(update, context):
+
+    query = update.callback_query
+
+    if not await subscription_required(update, context):
+        return
+
+    await query.answer()
+
+    prices = get_stars_prices()
+
+    keyboard = []
+
+    for stars, price in prices.items():
+        keyboard.append([
+            InlineKeyboardButton(
+                f"⭐ {stars} Stars — {price:,} so'm",
+                callback_data=f"buy_stars_{stars}"
+            )
+        ])
+
+    keyboard.append([
+        InlineKeyboardButton(
+            "⬅️ Orqaga",
+            callback_data="home"
+        )
+    ])
+
+    await query.edit_message_text(
+        "⭐ Telegram Stars\n\n"
+        "Kerakli paketni tanlang:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def buy_stars(update, context):
+
+    query = update.callback_query
+
+    if not await subscription_required(update, context):
+        return
+
+    await query.answer()
+
+    try:
+        stars = int(
+            query.data.replace("buy_stars_", "")
+        )
+    except ValueError:
+        await query.answer(
+            "Noto‘g‘ri paket!",
+            show_alert=True
+        )
+        return
+
+    prices = get_stars_prices()
+
+    if stars not in prices:
+        await query.answer(
+            "Bu paket mavjud emas!",
+            show_alert=True
+        )
+        return
+
+    payload = f"stars|{stars}|{query.from_user.id}"
+
+    await context.bot.send_invoice(
+        chat_id=query.from_user.id,
+        title=f"{stars} Telegram Stars",
+        description=(
+            f"{stars} Stars paketi\n"
+            f"Katalog narxi: {prices[stars]:,} so'm"
+        ),
+        payload=payload,
+        currency="XTR",
+        prices=[
+            LabeledPrice(
+                label=f"{stars} Telegram Stars",
+                amount=stars
+            )
+        ],
+    )
+
+
+# =========================================================
+# PREMIUM
+# =========================================================
+
+async def premium_menu(update, context):
+
+    query = update.callback_query
+
+    if not await subscription_required(update, context):
+        return
+
+    await query.answer()
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "🔐 Akkountga kirib olish",
+                callback_data="premium_account"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🎁 Gift sifatida yuborish",
+                callback_data="premium_gift"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "⬅️ Orqaga",
+                callback_data="home"
+            )
+        ],
+    ]
+
+    await query.edit_message_text(
+        "💎 Telegram Premium\n\n"
+        "Premium turini tanlang:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def premium_account(update, context):
+
+    query = update.callback_query
+
+    if not await subscription_required(update, context):
+        return
+
+    await query.answer()
+
+    prices = get_account_prices()
+
+    keyboard = []
+
+    for months, price in prices.items():
+        keyboard.append([
+            InlineKeyboardButton(
+                f"💎 {months} oy — {price:,} so'm",
+                callback_data=f"account_{months}"
+            )
+        ])
+
+    keyboard.append([
+        InlineKeyboardButton(
+            "⬅️ Orqaga",
+            callback_data="premium"
+        )
+    ])
+
+    await query.edit_message_text(
+        "🔐 Akkountga kirib olinadigan Premium\n\n"
+        "💡 Bu xizmat admin tomonidan bajariladi.\n\n"
+        "⚠️ Telegram login kodi yoki 2FA "
+        "parolini botga yubormang.",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def premium_gift(update, context):
+
+    query = update.callback_query
+
+    if not await subscription_required(update, context):
+        return
+
+    await query.answer()
+
+    prices = get_gift_prices()
+
+    keyboard = []
+
+    for months, price in prices.items():
+        keyboard.append([
+            InlineKeyboardButton(
+                f"🎁 {months} oy — {price:,} so'm",
+                callback_data=f"gift_{months}"
+            )
+        ])
+
+    keyboard.append([
+        InlineKeyboardButton(
+            "⬅️ Orqaga",
+            callback_data="premium"
+        )
+    ])
+
+    await query.edit_message_text(
+        "🎁 Premium Gift\n\n"
+        "Premiumni boshqa Telegram akkauntiga "
+        "yuborish xizmati.",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+# =========================================================
+# PREMIUM ORDERS
+# =========================================================
+
+async def account_order(update, context):
+
+    query = update.callback_query
+
+    if not await subscription_required(update, context):
+        return
+
+    await query.answer()
+
+    try:
+        months = int(
+            query.data.replace("account_", "")
+        )
+    except ValueError:
+        await query.answer(
+            "Xato!",
+            show_alert=True
+        )
+        return
+
+    prices = get_account_prices()
+
+    if months not in prices:
+        await query.answer(
+            "Bu paket mavjud emas.",
+            show_alert=True
+        )
+        return
+
+    price = prices[months]
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT INTO orders
+        (
+            user_id,
+            product_type,
+            product_name,
+            catalog_price,
+            xtr_price,
+            status
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (
+        query.from_user.id,
+        "premium_account",
+        f"Premium {months} oy — Akkount",
+        price,
+        0,
+        "pending_admin"
+    ))
+
+    order_id = cur.lastrowid
+
+    conn.commit()
+    conn.close()
+
+    await query.message.reply_text(
+        f"💎 Premium {months} oy\n"
+        f"💰 Narxi: {price:,} so'm\n\n"
+        "👨‍💼 Bu xizmat admin tomonidan bajariladi.\n\n"
+        f"🧾 Buyurtma №{order_id}\n"
+        "📌 Holat: Admin bilan bog‘lanish kerak."
+    )
+
+    await notify_admins(
+        context,
+        (
+            "🔔 YANGI PREMIUM BUYURTMA\n\n"
+            f"🧾 Buyurtma: #{order_id}\n"
+            f"👤 User ID: {query.from_user.id}\n"
+            f"👤 Username: @{query.from_user.username or 'yo‘q'}\n"
+            f"💎 Premium: {months} oy\n"
+            f"💰 Narx: {price:,} so'm\n"
+            "📌 Holat: pending_admin"
+        )
+    )
+
+
+async def gift_order(update, context):
+
+    query = update.callback_query
+
+    if not await subscription_required(update, context):
+        return
+
+    await query.answer()
+
+    try:
+        months = int(
+            query.data.replace("gift_", "")
+        )
+    except ValueError:
+        await query.answer(
+            "Xato!",
+            show_alert=True
+        )
+        return
+
+    prices = get_gift_prices()
+
+    if months not in prices:
+        await query.answer(
+            "Bu paket mavjud emas.",
+            show_alert=True
+        )
+        return
+
+    price = prices[months]
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT INTO orders
+        (
+            user_id,
+            product_type,
+            product_name,
+            catalog_price,
+            xtr_price,
+            status
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (
+        query.from_user.id,
+        "premium_gift",
+        f"Premium Gift {months} oy",
+        price,
+        0,
+        "pending_admin"
+    ))
+
+    order_id = cur.lastrowid
+
+    conn.commit()
+    conn.close()
+
+    await query.message.reply_text(
+        f"🎁 Premium Gift — {months} oy\n"
+        f"💰 Narxi: {price:,} so'm\n\n"
+        f"🧾 Buyurtma №{order_id}\n"
+        "📌 Holat: kutilmoqda."
+    )
+
+    await notify_admins(
+        context,
+        (
+            "🔔 YANGI GIFT BUYURTMA\n\n"
+            f"🧾 Buyurtma: #{order_id}\n"
+            f"👤 User ID: {query.from_user.id}\n"
+            f"👤 Username: @{query.from_user.username or 'yo‘q'}\n"
+            f"🎁 Premium Gift: {months} oy\n"
+            f"💰 Narx: {price:,} so'm"
+        )
+    )
+
+
+# =========================================================
+# ORDERS
+# =========================================================
+
+async def orders(update, context):
+
+    query = update.callback_query
+
+    if not await subscription_required(update, context):
+        return
+
+    await query.answer()
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT
+            id,
+            product_name,
+            catalog_price,
+            status,
+            created_at
+        FROM orders
+        WHERE user_id = ?
+        ORDER BY id DESC
+        LIMIT 15
+    """, (query.from_user.id,))
+
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        text = "📦 Sizda hali buyurtmalar yo‘q."
+    else:
+        text = "📦 Buyurtmalarim\n\n"
+
+        status_names = {
+            "pending": "⏳ Kutilmoqda",
+            "paid": "✅ To‘langan",
+            "completed": "🎉 Bajarildi",
+            "pending_admin": "👨‍💼 Admin bajaradi",
+            "cancelled": "❌ Bekor qilingan",
+        }
+
+        for order_id, product, price, status, created_at in rows:
+            text += (
+                f"🧾 #{order_id}\n"
+                f"🛍 {product}\n"
+                f"💰 {price:,} so'm\n"
+                f"📌 {status_names.get(status, status)}\n"
+                f"🕐 {created_at}\n\n"
+            )
+
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "⬅️ Orqaga",
+                    callback_data="home"
+                )
+            ]
+        ])
+    )
+
+
+# =========================================================
+# HELP
+# =========================================================
+
+async def help_menu(update, context):
+
+    query = update.callback_query
+    await query.answer()
+
+    await query.edit_message_text(
+        "📞 Yordam\n\n"
+        "Buyurtma bo‘yicha muammo bo‘lsa, "
+        "admin bilan bog‘laning.",
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "⬅️ Orqaga",
+                    callback_data="home"
+                )
+            ]
+        ])
+    )
+
+
+# =========================================================
+# ADMIN YORDAMCHI
+# =========================================================
+
+async def notify_admins(context, text):
+
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=text
+            )
+        except Exception as e:
+            logger.warning(
+                "Admin notification error: %s",
+                e
+            )
+
+
+# =========================================================
+# ADMIN PANEL
+# =========================================================
+
+async def admin_command(update, context):
+
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text(
+            "⛔ Siz admin emassiz."
+        )
+        return
+
+    await show_admin_panel(update, context)
+
+
+async def show_admin_panel(update, context):
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "📊 Statistika",
+                callback_data="admin_stats"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "📦 Buyurtmalar",
+                callback_data="admin_orders"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "👥 Foydalanuvchilar",
+                callback_data="admin_users"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "💰 Stars narxlari",
+                callback_data="admin_stars"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "💎 Premium narxlari",
+                callback_data="admin_premium"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "📢 Majburiy kanallar",
+                callback_data="admin_channels"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🏠 Bosh menyu",
+                callback_data="home"
+            )
+        ],
+    ]
+
+    text = (
+        "👑 FrostShop Admin Panel\n\n"
+        "Kerakli bo‘limni tanlang:"
+    )
+
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    else:
+        await update.message.reply_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+
+# =========================================================
+# ADMIN STATS
+# =========================================================
+
+async def admin_stats(update, context):
+
+    query = update.callback_query
+
+    if not is_admin(query.from_user.id):
+        await query.answer(
+            "⛔ Ruxsat yo‘q.",
+            show_alert=True
+        )
+        return
+
+    await query.answer()
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("SELECT COUNT(*) FROM users")
+    users = cur.fetchone()[0]
+
+    cur.execute("SELECT COUNT(*) FROM orders")
+    order_count = cur.fetchone()[0]
+
+    cur.execute("""
+        SELECT COUNT(*)
+        FROM orders
+        WHERE status = 'paid'
+    """)
+    paid = cur.fetchone()[0]
+
+    cur.execute("""
+        SELECT COUNT(*)
+        FROM orders
+        WHERE status = 'completed'
+    """)
+    completed = cur.fetchone()[0]
+
+    conn.close()
+
+    await query.edit_message_text(
+        "📊 STATISTIKA\n\n"
+        f"👥 Foydalanuvchilar: {users}\n"
+        f"📦 Buyurtmalar: {order_count}\n"
+        f"💳 To‘langan: {paid}\n"
+        f"✅ Bajarilgan: {completed}",
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "⬅️ Admin panel",
+                    callback_data="admin"
+                )
+            ]
+        ])
+    )
+
+
+# =========================================================
+# ADMIN USERS
+# =========================================================
+
+async def admin_users(update, context):
+
+    query = update.callback_query
+
+    if not is_admin(query.from_user.id):
+        await query.answer(
+            "⛔ Ruxsat yo‘q.",
+            show_alert=True
+        )
+        return
+
+    await query.answer()
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT user_id, username, first_name
+        FROM users
+        ORDER BY created_at DESC
+        LIMIT 30
+    """)
+
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        text = "👥 Hali foydalanuvchilar yo‘q."
+    else:
+        text = "👥 FOYDALANUVCHILAR\n\n"
+
+        for user_id, username, first_name in rows:
+            text += (
+                f"🆔 {user_id}\n"
+                f"👤 {first_name}\n"
+                f"@{username or 'yo‘q'}\n\n"
+            )
+
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "⬅️ Admin panel",
+                    callback_data="admin"
+                )
+            ]
+        ])
+    )
+
+
+# =========================================================
+# ADMIN ORDERS
+# =========================================================
+
+async def admin_orders(update, context):
+
+    query = update.callback_query
+
+    if not is_admin(query.from_user.id):
+        await query.answer(
+            "⛔ Ruxsat yo‘q.",
+            show_alert=True
+        )
+        return
+
+    await query.answer()
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT
+            id,
+            user_id,
+            product_name,
+            catalog_price,
+            status,
+            created_at
+        FROM orders
+        ORDER BY id DESC
+        LIMIT 30
+    """)
+
+    rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        text = "📦 Hali buyurtmalar yo‘q."
+    else:
+        text = "📦 SO‘NGGI BUYURTMALAR\n\n"
+
+        for (
+            order_id,
+            user_id,
+            product,
+            price,
+            status,
+            created_at
+        ) in rows:
+
+            text += (
+                f"#{order_id} | User: {user_id}\n"
+                f"🛍 {product}\n"
+                f"💰 {price:,} so'm\n"
+                f"📌 {status}\n"
+                f"🕐 {created_at}\n\n"
+            )
+
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "⬅️ Admin panel",
+                    callback_data="admin"
+                )
+            ]
+        ])
+    )
+
+
+# =========================================================
+# ADMIN STARS
+# =========================================================
+
+async def admin_stars(update, context):
+
+    query = update.callback_query
+
+    if not is_admin(query.from_user.id):
+        await query.answer(
+            "⛔ Ruxsat yo‘q.",
+            show_alert=True
+        )
+        return
+
+    await query.answer()
+
+    prices = get_stars_prices()
+
+    text = "⭐ STARS NARXLARI\n\n"
+
+    for stars, price in prices.items():
+        text += f"{stars} ⭐ = {price:,} so'm\n"
+
+    text += (
+        "\nNarx o‘zgartirish:\n"
+        "/setstars STARS NARX\n\n"
+        "Misol:\n"
+        "/setstars 200 40000"
+    )
+
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "⬅️ Admin panel",
+                    callback_data="admin"
+                )
+            ]
+        ])
+    )
+
+
+# =========================================================
+# ADMIN PREMIUM
+# =========================================================
+
+async def admin_premium(update, context):
+
+    query = update.callback_query
+
+    if not is_admin(query.from_user.id):
+        await query.answer(
+            "⛔ Ruxsat yo‘q.",
+            show_alert=True
+        )
+        return
+
+    await query.answer()
+
+    account = get_account_prices()
+    gift = get_gift_prices()
+
+    text = "💎 PREMIUM NARXLARI\n\n🔐 Akkount:\n"
+
+    for months, price in account.items():
+        text += f"{months} oy = {price:,} so'm\n"
+
+    text += "\n🎁 Gift:\n"
+
+    for months, price in gift.items():
+        text += f"{months} oy = {price:,} so'm\n"
+
+    text += (
+        "\nAkkount narxi:\n"
+        "/setaccount 1 40000\n"
+        "/setaccount 12 310000\n\n"
+        "Gift narxi:\n"
+        "/setgift 3 170000\n"
+        "/setgift 6 230000\n"
+        "/setgift 12 395000"
+    )
+
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "⬅️ Admin panel",
+                    callback_data="admin"
+                )
+            ]
+        ])
+    )
+
+
+# =========================================================
+# ADMIN CHANNELS
+# =========================================================
+
+async def admin_channels(update, context):
+
+    query = update.callback_query
+
+    if not is_admin(query.from_user.id):
+        await query.answer(
+            "⛔ Ruxsat yo‘q.",
+            show_alert=True
+        )
+        return
+
+    await query.answer()
+
+    channels = get_required_channels()
+
+    text = "📢 MAJBURIY KANALLAR\n\n"
+
+    if not channels:
+        text += "❌ Hozircha majburiy kanal yo‘q.\n\n"
+    else:
+        for i, (_, channel) in enumerate(channels, 1):
+            text += f"{i}. {channel}\n"
+
+        text += "\n"
+
+    text += (
+        "➕ Qo‘shish:\n"
+        "/addchannel @kanal\n\n"
+        "🗑 O‘chirish:\n"
+        "/delchannel @kanal\n\n"
+        "⚠️ Bot har bir kanalga admin bo‘lishi kerak.\n"
+        "👑 Admin uchun obuna shart emas."
+    )
+
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "🔄 Yangilash",
+                    callback_data="admin_channels"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "⬅️ Admin panel",
+                    callback_data="admin"
+                )
+            ],
+        ])
+    )
+
+
+# =========================================================
+# ADMIN COMMANDS
+# =========================================================
+
+async def addchannel(update, context):
+
+    if not is_admin(update.effective_user.id):
+        return
+
+    if len(context.args) != 1:
+        await update.message.reply_text(
+            "Format:\n/addchannel @kanal_username"
+        )
+        return
+
+    channel = context.args[0].strip()
+
+    if not channel.startswith("@"):
+        channel = "@" + channel
+
+    if len(channel) <= 1:
+        await update.message.reply_text(
+            "❌ Kanal username noto‘g‘ri."
+        )
+        return
+
+    if add_required_channel(channel):
+        await update.message.reply_text(
+            f"✅ Kanal qo‘shildi: {channel}\n\n"
+            "⚠️ Bot kanalga admin sifatida "
+            "qo‘shilgan bo‘lishi kerak."
+        )
+    else:
+        await update.message.reply_text(
+            "ℹ️ Bu kanal allaqachon mavjud."
+        )
+
+
+async def delchannel(update, context):
+
+    if not is_admin(update.effective_user.id):
+        return
+
+    if len(context.args) != 1:
+        await update.message.reply_text(
+            "Format:\n/delchannel @kanal_username"
+        )
+        return
+
+    channel = context.args[0].strip()
+
+    if not channel.startswith("@"):
+        channel = "@" + channel
+
+    if delete_required_channel(channel):
+        await update.message.reply_text(
+            f"✅ Kanal o‘chirildi: {channel}"
+        )
+    else:
+        await update.message.reply_text(
+            "❌ Kanal topilmadi."
+        )
+
+
+async def setstars(update, context):
+
+    if not is_admin(update.effective_user.id):
+        return
+
+    if len(context.args) != 2:
+        await update.message.reply_text(
+            "Format:\n/setstars STARS NARX\n\n"
+            "Misol:\n"
+            "/setstars 200 40000"
+        )
+        return
+
+    try:
+        stars = int(context.args[0])
+        price = int(context.args[1])
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Sonlarni to‘g‘ri kiriting."
+        )
+        return
+
+    if stars <= 0 or price <= 0:
+        await update.message.reply_text(
+            "❌ Sonlar 0 dan katta bo‘lishi kerak."
+        )
+        return
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT OR REPLACE INTO stars_prices
+        (stars, uzs_price)
+        VALUES (?, ?)
+    """, (stars, price))
+
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text(
+        f"✅ {stars} Stars = {price:,} so‘m"
+    )
+
+
+async def setaccount(update, context):
+
+    if not is_admin(update.effective_user.id):
+        return
+
+    if len(context.args) != 2:
+        await update.message.reply_text(
+            "Format:\n/setaccount OY NARX"
+        )
+        return
+
+    try:
+        months = int(context.args[0])
+        price = int(context.args[1])
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Sonlarni to‘g‘ri kiriting."
+        )
+        return
+
+    if months <= 0 or price <= 0:
+        await update.message.reply_text(
+            "❌ Sonlar 0 dan katta bo‘lishi kerak."
+        )
+        return
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT OR REPLACE INTO premium_account_prices
+        (months, uzs_price)
+        VALUES (?, ?)
+    """, (months, price))
+
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text(
+        f"✅ Akkount Premium {months} oy = "
+        f"{price:,} so‘m"
+    )
+
+
+async def setgift(update, context):
+
+    if not is_admin(update.effective_user.id):
+        return
+
+    if len(context.args) != 2:
+        await update.message.reply_text(
+            "Format:\n/setgift OY NARX"
+        )
+        return
+
+    try:
+        months = int(context.args[0])
+        price = int(context.args[1])
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Sonlarni to‘g‘ri kiriting."
+        )
+        return
+
+    if months <= 0 or price <= 0:
+        await update.message.reply_text(
+            "❌ Sonlar 0 dan katta bo‘lishi kerak."
+        )
+        return
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT OR REPLACE INTO premium_gift_prices
+        (months, uzs_price)
+        VALUES (?, ?)
+    """, (months, price))
+
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text(
+        f"✅ Gift Premium {months} oy = "
+        f"{price:,} so‘m"
+    )
+
+
+# =========================================================
+# CALLBACK ROUTER
+# =========================================================
+
+async def callback_router(update, context):
+
+    query = update.callback_query
+    data = query.data
+
+    # ADMIN
+    if data == "admin" or data.startswith("admin_"):
+        await admin_router(update, context)
+        return
+
+    # SUBSCRIPTION
+    if data == "check_sub":
+
+        if is_admin(query.from_user.id):
+            await query.answer(
+                "👑 Admin uchun obuna shart emas.",
+                show_alert=True
+            )
+            await show_home(update, context)
+            return
+
+        if await is_subscribed(
+            context.bot,
+            query.from_user.id
+        ):
+            await query.answer(
+                "✅ Obuna tasdiqlandi!",
+                show_alert=True
+            )
+            await show_home(update, context)
+        else:
+            await query.answer(
+                "❌ Barcha kanallarga obuna bo‘ling.",
+                show_alert=True
+            )
+            await subscription_required(
+                update,
+                context
+            )
+
+        return
+
+    if not await is_subscribed(
+        context.bot,
+        query.from_user.id
+    ):
+        await subscription_required(update, context)
+        return
+
+    # HOME
+    if data == "home":
+        await query.answer()
+        await show_home(update, context)
+
+    # STARS
+    elif data == "stars":
+        await stars_menu(update, context)
+
+    elif data.startswith("buy_stars_"):
+        await buy_stars(update, context)
+
+    # PREMIUM
+    elif data == "premium":
+        await premium_menu(update, context)
+
+    elif data == "premium_account":
+        await premium_account(update, context)
+
+    elif data.startswith("account_"):
+        await account_order(update, context)
+
+    elif data == "premium_gift":
+        await premium_gift(update, context)
+
+    elif data.startswith("gift_"):
+        await gift_order(update, context)
+
+    # ORDERS
+    elif data == "orders":
+        await orders(update, context)
+
+    # HELP
+    elif data == "help":
+        await help_menu(update, context)
+
+
+async def admin_router(update, context):
+
+    query = update.callback_query
+
+    if not is_admin(query.from_user.id):
+        await query.answer(
+            "⛔ Ruxsat yo‘q.",
+            show_alert=True
+        )
+        return
+
+    data = query.data
+
+    if data == "admin":
+        await query.answer()
+        await show_admin_panel(update, context)
+
+    elif data == "admin_stats":
+        await admin_stats(update, context)
+
+    elif data == "admin_orders":
+        await admin_orders(update, context)
+
+    elif data == "admin_users":
+        await admin_users(update, context)
+
+    elif data == "admin_stars":
+        await admin_stars(update, context)
+
+    elif data == "admin_premium":
+        await admin_premium(update, context)
+
+    elif data == "admin_channels":
+        await admin_channels(update, context)
+
+
+# =========================================================
+# PAYMENT
+# =========================================================
+
+async def precheckout_callback(update, context):
+
+    query = update.pre_checkout_query
+
+    if query.currency != "XTR":
+        await query.answer(
+            ok=False,
+            error_message="To‘lov valyutasi noto‘g‘ri."
+        )
+        return
+
+    await query.answer(ok=True)
+
+
+async def successful_payment_callback(update, context):
+
+    payment = update.message.successful_payment
+    user = update.effective_user
+
+    if payment.currency != "XTR":
+        await update.message.reply_text(
+            "❌ Noto‘g‘ri to‘lov valyutasi."
+        )
+        return
+
+    charge_id = payment.telegram_payment_charge_id
+    payload = payment.invoice_payload
+    amount = payment.total_amount
+
+    parts = payload.split("|")
+
+    if len(parts) < 3 or parts[0] != "stars":
+        await update.message.reply_text(
+            "❌ To‘lov ma'lumotida xatolik."
+        )
+        return
+
+    try:
+        stars = int(parts[1])
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Stars miqdori noto‘g‘ri."
+        )
+        return
+
+    prices = get_stars_prices()
+
+    if stars not in prices:
+        await update.message.reply_text(
+            "❌ Bu Stars paketi topilmadi."
+        )
+        return
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT id
+        FROM orders
+        WHERE telegram_charge_id = ?
+    """, (charge_id,))
+
+    if cur.fetchone():
+        conn.close()
+
+        await update.message.reply_text(
+            "ℹ️ Bu to‘lov avval qayd qilingan."
+        )
+        return
+
+    cur.execute("""
+        INSERT INTO orders
+        (
+            user_id,
+            product_type,
+            product_name,
+            catalog_price,
+            xtr_price,
+            status,
+            telegram_charge_id
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (
+        user.id,
+        "stars",
+        f"{stars} Telegram Stars",
+        prices[stars],
+        amount,
+        "paid",
+        charge_id
+    ))
+
+    order_id = cur.lastrowid
+
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text(
+        "✅ To‘lov muvaffaqiyatli qayd qilindi!\n\n"
+        f"⭐ Paket: {stars} Stars\n"
+        f"🧾 Buyurtma: #{order_id}\n"
+        "📌 Holat: to‘landi.\n\n"
+        "ℹ️ Buyurtmani bajarish admin tomonidan "
+        "amalga oshiriladi."
+    )
+
+    await notify_admins(
+        context,
+        (
+            "💰 YANGI TO‘LOV!\n\n"
+            f"🧾 Buyurtma: #{order_id}\n"
+            f"👤 User ID: {user.id}\n"
+            f"👤 Username: @{user.username or 'yo‘q'}\n"
+            f"⭐ Stars: {stars}\n"
+            f"💳 XTR: {amount}\n"
+            f"💰 Katalog narxi: {prices[stars]:,} so'm\n"
+            f"🔑 Charge ID: {charge_id}\n"
+            "📌 Holat: PAID"
+        )
+    )
+
+
+# =========================================================
+# ERROR
+# =========================================================
+
+async def error_handler(update, context):
+
+    logger.error(
+        "Bot xatosi:",
+        exc_info=context.error
+    )
+
+
+# =========================================================
+# MAIN
+# =========================================================
+
+def main():
+
+    init_db()
+
+    app = (
+        Application
+        .builder()
+        .token(BOT_TOKEN)
+        .build()
+    )
+
+    # COMMANDS
+    app.add_handler(
+        CommandHandler("start", start)
+    )
+
+    app.add_handler(
+        CommandHandler("admin", admin_command)
+    )
+
+    app.add_handler(
+        CommandHandler("setstars", setstars)
+    )
+
+    app.add_handler(
+        CommandHandler("setaccount", setaccount)
+    )
+
+    app.add_handler(
+        CommandHandler("setgift", setgift)
+    )
+
+    app.add_handler(
+        CommandHandler("addchannel", addchannel)
+    )
+
+    app.add_handler(
+        CommandHandler("delchannel", delchannel)
+    )
+
+    # CALLBACKS
+    app.add_handler(
+        CallbackQueryHandler(callback_router)
+    )
+
+    # PAYMENT
+    app.add_handler(
+        PreCheckoutQueryHandler(
+            precheckout_callback
+        )
+    )
+
+    app.add_handler(
+        MessageHandler(
+            filters.SUCCESSFUL_PAYMENT,
+            successful_payment_callback
+        )
+    )
+
+    # ERROR
+    app.add_error_handler(error_handler)
+
+    print("================================")
+    print("🤖 FrostShop ishga tushdi...")
+    print("================================")
+
+    app.run_polling(
+        drop_pending_updates=True
+    )
+
+
+if __name__ == "__main__":
+    main()
